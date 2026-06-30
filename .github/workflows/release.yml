@@ -113,9 +113,10 @@ jobs:
           else
             cp build/ace-server dist/
             cp -P build/libggml*.so* dist/ 2>/dev/null || true
-            # ace-server's build rpath is absolute; make it relocatable.
-            sudo apt-get install -y patchelf
-            patchelf --set-rpath '$ORIGIN' dist/ace-server
+            # ace-server + ggml's own .so keep absolute build-dir RUNPATHs; rewrite
+            # every ELF to $ORIGIN so the bundle is self-contained after relocation.
+            sudo apt-get install -y -qq patchelf
+            for f in $(find dist -type f); do patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done
             ASSET="acestep-${{ matrix.backend }}-linux-x64.tar.gz"
             tar -C dist -czf "$ASSET" .
           fi
