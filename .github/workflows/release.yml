@@ -134,7 +134,7 @@ jobs:
           set -e
           case "${{ matrix.backend }}" in
             vulkan) FLAGS="-DGGML_VULKAN=ON" ;;
-            cuda)   FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90" ;;
+            cuda)   FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120;120-virtual" ;;
             # One flagship gfx per consumer family (RX6000/7000/9000 + Strix Halo).
             rocm)   FLAGS="-DGGML_HIP=ON -DGPU_TARGETS=gfx1030;gfx1100;gfx1151;gfx1201 -DCMAKE_C_COMPILER=$ROCM_CC -DCMAKE_CXX_COMPILER=$ROCM_CXX -DCMAKE_PREFIX_PATH=$HIP_PATH -DCMAKE_HIP_COMPILER=$ROCM_CXX" ;;
           esac
@@ -149,13 +149,25 @@ jobs:
           if [ "${{ matrix.os }}" = "windows" ]; then
             cp build/ace-server.exe dist/
             cp build/*.dll dist/ 2>/dev/null || true
+            if [ "${{ matrix.backend }}" = "cuda" ]; then
+              cp "$CUDA_PATH"/bin/cudart64_*.dll "$CUDA_PATH"/bin/cublas64_*.dll "$CUDA_PATH"/bin/cublasLt64_*.dll dist/ 2>/dev/null || true
+            fi
             ASSET="acestep-${{ matrix.backend }}-windows-x64.zip"
             (cd dist && 7z a -y "../$ASSET" ./* >/dev/null)
           else
             cp build/ace-server dist/
             cp -P build/libggml*.so* dist/ 2>/dev/null || true
-            # Slim: the ROCm runtime comes from the shared TheRock SDK that Lemonade
-            # installs per the user's gfx arch (via LD_LIBRARY_PATH), not bundled here.
+            # The ROCm runtime comes from the shared TheRock SDK that Lemonade
+            # installs per the user's gfx arch (via LD_LIBRARY_PATH), not bundled
+            # here. CUDA has no such shared SDK, so bundle its runtime next to the
+            # binary (mirrors sd-cpp / llama.cpp); the $ORIGIN rpath below then
+            # resolves it with no system CUDA toolkit required.
+            if [ "${{ matrix.backend }}" = "cuda" ]; then
+              cuda_lib="${CUDA_PATH:-/usr/local/cuda}/lib64"
+              for l in libcudart libcublas libcublasLt; do
+                cp -P "$cuda_lib"/$l.so* dist/ 2>/dev/null || true
+              done
+            fi
             sudo apt-get install -y -qq patchelf
             for f in $(find dist -type f); do patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true; done
             ASSET="acestep-${{ matrix.backend }}-linux-x64.tar.gz"
