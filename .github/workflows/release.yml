@@ -134,7 +134,9 @@ jobs:
           set -e
           case "${{ matrix.backend }}" in
             vulkan) FLAGS="-DGGML_VULKAN=ON" ;;
-            cuda)   FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120;120-virtual" ;;
+            # ggml rewrites 12x -> 12xa (arch-specific); Blackwell ships SASS-only
+            # (120a can't be virtual), so no PTX fallback entry here.
+            cuda)   FLAGS="-DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75;80;86;89;90;120" ;;
             # One flagship gfx per consumer family (RX6000/7000/9000 + Strix Halo).
             rocm)   FLAGS="-DGGML_HIP=ON -DGPU_TARGETS=gfx1030;gfx1100;gfx1151;gfx1201 -DCMAKE_C_COMPILER=$ROCM_CC -DCMAKE_CXX_COMPILER=$ROCM_CXX -DCMAKE_PREFIX_PATH=$HIP_PATH -DCMAKE_HIP_COMPILER=$ROCM_CXX" ;;
           esac
