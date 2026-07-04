@@ -152,7 +152,12 @@ jobs:
             cp build/ace-server.exe dist/
             cp build/*.dll dist/ 2>/dev/null || true
             if [ "${{ matrix.backend }}" = "cuda" ]; then
-              cp "$CUDA_PATH"/bin/cudart64_*.dll "$CUDA_PATH"/bin/cublas64_*.dll "$CUDA_PATH"/bin/cublasLt64_*.dll dist/ 2>/dev/null || true
+              # $CUDA_PATH is a Windows path (backslashes/spaces) that breaks bash
+              # globbing; convert it, and let cp fail loudly (set -e) rather than
+              # silently shipping a zip with no CUDA runtime.
+              cuda_bin="$(cygpath -u "$CUDA_PATH")/bin"
+              cp "$cuda_bin"/cudart64_*.dll "$cuda_bin"/cublas64_*.dll "$cuda_bin"/cublasLt64_*.dll dist/
+              ls -la dist/cudart64_*.dll dist/cublas64_*.dll dist/cublasLt64_*.dll
             fi
             ASSET="acestep-${{ matrix.backend }}-windows-x64.zip"
             (cd dist && 7z a -y "../$ASSET" ./* >/dev/null)
