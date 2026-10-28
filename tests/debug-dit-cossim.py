@@ -10,6 +10,7 @@ Usage:
     ./debug-dit-cossim.py --mode sft      # SFT BF16
     ./debug-dit-cossim.py --mode xl-turbo # XL turbo BF16
     ./debug-dit-cossim.py --mode all      # all 4 models
+    ./debug-dit-cossim.py --device CPU    # pick the GGML device
 """
 import os, sys, subprocess, struct, shutil, argparse, json
 import numpy as np
@@ -109,7 +110,7 @@ def codes_to_python_format(codes_csv):
 
 # GGML runner
 
-def run_ggml(dump_dir, req, cfg, gguf_path, adapter_dir=None):
+def run_ggml(dump_dir, req, cfg, gguf_path, adapter_dir=None, device=None):
     ggml_bin = "../build/ace-synth"
     if not os.path.isfile(ggml_bin):
         print(f"[GGML] binary not found: {ggml_bin}")
@@ -141,6 +142,8 @@ def run_ggml(dump_dir, req, cfg, gguf_path, adapter_dir=None):
     cmd = [ggml_bin, "--models", models_dir]
     if adapters_root:
         cmd += ["--adapters", adapters_root]
+    if device:
+        cmd += ["--device", device]
     cmd += [
         "--request", request_json,
         "--dump", dump_dir,
@@ -454,7 +457,7 @@ def compare(dirs, stages, tag):
 
 # main
 
-def run_mode(mode_name, cfg, req, gguf_path, adapter_dir=None):
+def run_mode(mode_name, cfg, req, gguf_path, adapter_dir=None, device=None):
     dump_ggml   = f"ggml-{mode_name}"
     dump_python = f"python-{mode_name}"
 
@@ -466,7 +469,7 @@ def run_mode(mode_name, cfg, req, gguf_path, adapter_dir=None):
 
     if os.path.isdir(dump_ggml):
         shutil.rmtree(dump_ggml)
-    if not run_ggml(dump_ggml, req, cfg, gguf_path, adapter_dir):
+    if not run_ggml(dump_ggml, req, cfg, gguf_path, adapter_dir, device):
         print(f"[{tag}] GGML failed")
         return False
 
@@ -488,6 +491,8 @@ def main():
                     help="quantization suffix for GGUF (default: BF16, e.g. Q6_K, Q8_0)")
     ap.add_argument("--adapters", default=None,
                     help="path to adapter directory (optional)")
+    ap.add_argument("--device", default=None,
+                    help="GGML device passed to ace-synth (default: best available)")
     args = ap.parse_args()
 
     req = load_request()
@@ -501,7 +506,7 @@ def main():
             print(f"[Error] GGUF not found: {gguf_path}")
             ok = False
             continue
-        if not run_mode(m, cfg, req, gguf_path, args.adapters):
+        if not run_mode(m, cfg, req, gguf_path, args.adapters, args.device):
             ok = False
 
     return 0 if ok else 1

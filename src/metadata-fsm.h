@@ -620,20 +620,21 @@ static std::string codes_to_string(const std::vector<int> & codes) {
 // Phase 2: run audio code generation with all metas known
 // Returns comma-separated codes string (empty on failure)
 
-// Parse N Phase 1 outputs into N AcePrompts, merging into base.
+// Parse N Phase 1 outputs into N AcePrompts, merging each into its base.
 // merge_lyrics: true for simple mode (Phase 1 generates lyrics),
 //               false for partial mode (user provided lyrics).
 static void parse_phase1_into_aces(const std::vector<std::string> & texts,
-                                   const AcePrompt &                base,
+                                   const std::vector<AcePrompt> &   bases,
                                    std::vector<AcePrompt> &         aces,
-                                   long long                        base_seed,
+                                   const std::vector<uint32_t> &    seeds,
                                    const char *                     label,
                                    bool                             merge_lyrics,
                                    bool                             use_cot_caption = true) {
     int N = (int) texts.size();
     aces.resize(N);
     for (int i = 0; i < N; i++) {
-        fprintf(stderr, "[%s Batch%d] seed=%lld:\n%s\n", label, i, base_seed + i, texts[i].c_str());
+        const AcePrompt & base = bases[i];
+        fprintf(stderr, "[%s Batch%d] seed=%u:\n%s\n", label, i, seeds[i], texts[i].c_str());
         AcePrompt parsed = {};
         if (!parse_cot_and_lyrics(texts[i], &parsed)) {
             fprintf(stderr, "WARNING: batch %d CoT parse incomplete\n", i);

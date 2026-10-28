@@ -5,6 +5,7 @@
 
 #include "graph-arena.h"
 #include "qwen3-enc.h"  // Qwen3Layer, Qwen3Config, layer build helpers
+#include "static-graph.h"
 
 #include <cmath>
 #include <cstdio>
@@ -31,6 +32,30 @@ struct Qwen3LMConfig {
 #define QW3LM_MAX_KV_SETS 32  // batch N * 2 (cond + uncond CFG)
 #define QW3LM_MAX_LAYERS  64
 #define QW3LM_GRAPH_NODES 16384
+
+// Static batched decode graph. Built once per shape class and replayed with a
+// fresh input upload per step: n_kv_pad advances every 256 steps, N, the batch
+// base set, and the partial head window hold within a generation. A prefill
+// forward clobbers the shared sched allocation, so it invalidates this cache.
+struct Qw3lmGraphCache {
+    bool                  built         = false;
+    int                   key_n_kv_pad  = 0;
+    int                   key_N         = 0;
+    int                   key_s0        = 0;
+    int                   key_lm_offset = 0;
+    int                   key_lm_count  = 0;
+    int                   out_V         = 0;
+    struct ggml_cgraph *  gf            = nullptr;
+    struct ggml_tensor *  token_ids_t   = nullptr;
+    struct ggml_tensor *  positions     = nullptr;
+    struct ggml_tensor *  kv_rows       = nullptr;
+    struct ggml_tensor *  attn_mask     = nullptr;
+    struct ggml_tensor *  lgt           = nullptr;
+    StaticGraph           graph;
+    std::vector<int>      pos_data;
+    std::vector<int64_t>  rows_data;
+    std::vector<uint16_t> mask_data;
+};
 
 struct Qwen3LM {
     Qwen3LMConfig cfg;
@@ -73,6 +98,9 @@ struct Qwen3LM {
     GraphArena arena_prefill;
     GraphArena arena_decode;
     GraphArena arena_batch;
+
+    // Static batched decode graph, replayed across the token loop.
+    Qw3lmGraphCache batch_graph;
 };
 
 // Parse config.json integers, floats, bools
@@ -269,8 +297,8 @@ static bool qw3lm_load(Qwen3LM * m, const char * gguf_path, int max_seq_len, int
     }
     const Qwen3LMConfig & c = m->cfg;
 
-    if (c.n_layers > QW3LM_MAX_LAYERS) {
-        fprintf(stderr, "[LM-Load] FATAL: %d layers > max %d\n", c.n_layers, QW3LM_MAX_LAYERS);
+    if (c.n_layers <= 0 || c.n_layers > QW3LM_MAX_LAYERS) {
+        fprintf(stderr, "[LM-Load] FATAL: invalid n_layers=%d (max %d)\n", c.n_layers, QW3LM_MAX_LAYERS);
         gf_close(&gf);
         return false;
     }
@@ -437,7 +465,7 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
     struct ggml_tensor * attn  = use_flash_attn ? ggml_flash_attn_ext(ctx, q, k_full, v_full, mask, scale, 0.0f, 0.0f) :
                                                   qwen3_attn_f32(ctx, q, k_full, v_full, mask, scale);
     if (use_flash_attn) {
-        ggml_flash_attn_ext_set_prec(attn, GGML_PREC_F32);
+        ggml_prec_set_acc(attn, GGML_PREC_F32);
     }
 
     // Reshape: [D, Nh, S] -> [Nh*D, S]
@@ -450,6 +478,11 @@ static struct ggml_tensor * qw3lm_build_attn(struct ggml_context * ctx,
 // Forward pass: token_ids[n_tokens] -> logits[vocab_size] (last token only)
 // kv_set: which KV cache set to use (0=conditional, 1=unconditional for CFG)
 static void qw3lm_forward(Qwen3LM * m, const int * token_ids, int n_tokens, int kv_set, float * logits) {
+    if (m->batch_graph.graph.sched_allocated) {
+        static_graph_release(&m->batch_graph.graph, m->sched);
+        m->batch_graph.built = false;
+    }
+
     const Qwen3LMConfig & c      = m->cfg;
     int                   H      = c.hidden_size;
     int                   kv_pos = m->kv_pos[kv_set];
@@ -625,201 +658,230 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
     const int n_kv_pad   = kv_pad_raw < c.max_seq_len ? kv_pad_raw : c.max_seq_len;
 
     // Persistent arena: stable node addresses across decode steps.
-    struct ggml_context * ctx = graph_arena_begin(&m->arena_batch);
-    struct ggml_cgraph *  gf  = ggml_new_graph_custom(ctx, QW3LM_GRAPH_NODES, false);
+    struct ggml_cgraph * gf          = nullptr;
+    struct ggml_tensor * token_ids_t = nullptr;
+    struct ggml_tensor * positions   = nullptr;
+    struct ggml_tensor * attn_mask   = nullptr;
+    struct ggml_tensor * kv_rows     = nullptr;
+    struct ggml_tensor * lgt         = nullptr;
+    int                  out_V       = 0;
 
-    // Embedding via ggml_get_rows (scheduler handles backend fallback)
-    struct ggml_tensor * token_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
-    ggml_set_name(token_ids_t, "token_ids");
-    ggml_set_input(token_ids_t);
+    const int  s0         = kv_sets[0];
+    const bool need_build = !m->batch_graph.built || m->batch_graph.key_n_kv_pad != n_kv_pad ||
+                            m->batch_graph.key_N != N || m->batch_graph.key_s0 != s0 ||
+                            m->batch_graph.key_lm_offset != lm_offset || m->batch_graph.key_lm_count != lm_count;
+    if (need_build) {
+        static_graph_release(&m->batch_graph.graph, m->sched);
+        m->batch_graph.built      = false;
+        struct ggml_context * ctx = graph_arena_begin(&m->arena_batch);
+        gf                        = ggml_new_graph_custom(ctx, QW3LM_GRAPH_NODES, false);
 
-    // Positions: [N], per-element kv_pos
-    struct ggml_tensor * positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
-    ggml_set_name(positions, "positions");
-    ggml_set_input(positions);
+        // Embedding via ggml_get_rows (scheduler handles backend fallback)
+        token_ids_t = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+        ggml_set_name(token_ids_t, "token_ids");
+        ggml_set_input(token_ids_t);
 
-    // Batched attention mask: [n_kv_pad, 1, 1, N] f16
-    // Per-element: 0 for valid KV positions, neg inf past elem kv_len,
-    // padded tail included
-    struct ggml_tensor * attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad, 1, 1, N);
-    ggml_set_name(attn_mask, "attn_mask");
-    ggml_set_input(attn_mask);
+        // Positions: [N], per-element kv_pos
+        positions = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, N);
+        ggml_set_name(positions, "positions");
+        ggml_set_input(positions);
 
-    // Per-element KV write positions as data: one row per set, broadcast
-    // across the Nkv head dim. Identical topology at every step, pure CUDA
-    // graph replay across the batched decode loop.
-    struct ggml_tensor * kv_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, 1, 1, N);
-    ggml_set_name(kv_rows, "kv_rows");
-    ggml_set_input(kv_rows);
+        // Batched attention mask: [n_kv_pad, 1, 1, N] f16
+        // Per-element: 0 for valid KV positions, neg inf past elem kv_len,
+        // padded tail included
+        attn_mask = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, n_kv_pad, 1, 1, N);
+        ggml_set_name(attn_mask, "attn_mask");
+        ggml_set_input(attn_mask);
 
-    struct ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, token_ids_t);
+        // Per-element KV write positions as data: one row per set, broadcast
+        // across the Nkv head dim. Identical topology at every step, pure CUDA
+        // graph replay across the batched decode loop.
+        kv_rows = ggml_new_tensor_3d(ctx, GGML_TYPE_I64, 1, 1, N);
+        ggml_set_name(kv_rows, "kv_rows");
+        ggml_set_input(kv_rows);
 
-    for (int l = 0; l < c.n_layers; l++) {
-        Qwen3Layer * ly = &m->layers[l];
+        struct ggml_tensor * hidden = ggml_get_rows(ctx, m->embed_tokens, token_ids_t);
 
-        // Pre-attention norm [H, N]
-        struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
+        for (int l = 0; l < c.n_layers; l++) {
+            Qwen3Layer * ly = &m->layers[l];
 
-        // Batched QKV projections (fused, partial, or separate)
-        struct ggml_tensor *q, *k, *v;
-        int                 q_dim  = Nh * D;
-        int                 kv_dim = Nkv * D;
-        if (ly->qkv) {
-            struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, norm);
-            q                        = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim, N, qkv->nb[1], 0));
-            k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) q_dim * qkv->nb[0]));
-            v = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
-        } else if (ly->qk) {
-            struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, norm);
-            q                       = ggml_cont(ctx, ggml_view_2d(ctx, qk, q_dim, N, qk->nb[1], 0));
-            k = ggml_cont(ctx, ggml_view_2d(ctx, qk, kv_dim, N, qk->nb[1], (size_t) q_dim * qk->nb[0]));
-            v = qwen3_linear(ctx, ly->v_proj, norm);
-        } else {
-            q = qwen3_linear(ctx, ly->q_proj, norm);
-            k = qwen3_linear(ctx, ly->k_proj, norm);
-            v = qwen3_linear(ctx, ly->v_proj, norm);
+            // Pre-attention norm [H, N]
+            struct ggml_tensor * norm = qwen3_rms_norm(ctx, hidden, ly->input_layernorm, c.rms_norm_eps);
+
+            // Batched QKV projections (fused, partial, or separate)
+            struct ggml_tensor *q, *k, *v;
+            int                 q_dim  = Nh * D;
+            int                 kv_dim = Nkv * D;
+            if (ly->qkv) {
+                struct ggml_tensor * qkv = qwen3_linear(ctx, ly->qkv, norm);
+                q                        = ggml_cont(ctx, ggml_view_2d(ctx, qkv, q_dim, N, qkv->nb[1], 0));
+                k = ggml_cont(ctx, ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) q_dim * qkv->nb[0]));
+                v = ggml_cont(ctx,
+                              ggml_view_2d(ctx, qkv, kv_dim, N, qkv->nb[1], (size_t) (q_dim + kv_dim) * qkv->nb[0]));
+            } else if (ly->qk) {
+                struct ggml_tensor * qk = qwen3_linear(ctx, ly->qk, norm);
+                q                       = ggml_cont(ctx, ggml_view_2d(ctx, qk, q_dim, N, qk->nb[1], 0));
+                k = ggml_cont(ctx, ggml_view_2d(ctx, qk, kv_dim, N, qk->nb[1], (size_t) q_dim * qk->nb[0]));
+                v = qwen3_linear(ctx, ly->v_proj, norm);
+            } else {
+                q = qwen3_linear(ctx, ly->q_proj, norm);
+                k = qwen3_linear(ctx, ly->k_proj, norm);
+                v = qwen3_linear(ctx, ly->v_proj, norm);
+            }
+
+            // Reshape to heads: [D, Heads, N]
+            q = ggml_reshape_3d(ctx, q, D, Nh, N);
+            k = ggml_reshape_3d(ctx, k, D, Nkv, N);
+            v = ggml_reshape_3d(ctx, v, D, Nkv, N);
+
+            // QK-Norm (rms_norm on dim0=D, per head per seq)
+            q = ggml_rms_norm(ctx, q, c.rms_norm_eps);
+            q = ggml_mul(ctx, q, qwen3_f32(ctx, ly->q_norm));
+            k = ggml_rms_norm(ctx, k, c.rms_norm_eps);
+            k = ggml_mul(ctx, k, qwen3_f32(ctx, ly->k_norm));
+
+            // RoPE: positions [N] maps to dim 2 of [D, Heads, N]
+            q = ggml_rope_ext(ctx, q, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+            k = ggml_rope_ext(ctx, k, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
+
+            // Contiguous for clean slicing
+            q = ggml_cont(ctx, q);
+            k = ggml_cont(ctx, k);
+            v = ggml_cont(ctx, v);
+
+            // Clamp V before F16 cast (sub-Ampere FP16 accumulation overflow)
+            if (m->clamp_fp16) {
+                v = ggml_clamp(ctx, v, -65504.0f, 65504.0f);
+            }
+
+            // Batched attention with 4D KV cache
+            float scale = 1.0f / sqrtf((float) D);
+
+            // Write new K,V to the 4D cache via set_rows over the N consecutive
+            // sets: dst views the [D, max_seq, Nkv, N] slice starting at s0, src
+            // reshapes the fresh [D, Nkv, N] to [D, 1, Nkv, N] (same layout), and
+            // kv_rows [1, 1, N] carries one destination row per set, broadcast
+            // across Nkv.
+            // sets are always consecutive: [s0, s0+1, ..., s0+N-1]
+            size_t off_s0 = (size_t) s0 * m->kv_k4[l]->nb[3];
+
+            struct ggml_tensor * k_sets = ggml_view_4d(ctx, m->kv_k4[l], D, c.max_seq_len, Nkv, N, m->kv_k4[l]->nb[1],
+                                                       m->kv_k4[l]->nb[2], m->kv_k4[l]->nb[3], off_s0);
+            struct ggml_tensor * v_sets = ggml_view_4d(ctx, m->kv_v4[l], D, c.max_seq_len, Nkv, N, m->kv_v4[l]->nb[1],
+                                                       m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3], off_s0);
+
+            struct ggml_tensor * k_new = ggml_reshape_4d(ctx, k, D, 1, Nkv, N);
+            struct ggml_tensor * v_new = ggml_reshape_4d(ctx, v, D, 1, Nkv, N);
+
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_sets, k_new, kv_rows));
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_sets, v_new, kv_rows));
+
+            // Q: [D, Nh, N] -> [D, 1, Nh, N] (n_batch=1, ne3=N for batched flash_attn)
+            struct ggml_tensor * q4 = ggml_reshape_4d(ctx, q, D, 1, Nh, N);
+
+            // Batched KV read: [D, n_kv_pad, Nkv, N] view of 4D cache
+            struct ggml_tensor * k_batch = ggml_view_4d(ctx, m->kv_k4[l], D, n_kv_pad, Nkv, N, m->kv_k4[l]->nb[1],
+                                                        m->kv_k4[l]->nb[2], m->kv_k4[l]->nb[3], off_s0);
+            struct ggml_tensor * v_batch = ggml_view_4d(ctx, m->kv_v4[l], D, n_kv_pad, Nkv, N, m->kv_v4[l]->nb[1],
+                                                        m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3], off_s0);
+
+            // Batched attention (flash or F32 manual fallback)
+            struct ggml_tensor * attn_result =
+                m->use_flash_attn ? ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f) :
+                                    qwen3_attn_f32(ctx, q4, k_batch, v_batch, attn_mask, scale);
+            if (m->use_flash_attn) {
+                ggml_prec_set_acc(attn_result, GGML_PREC_F32);
+            }
+
+            // Output: [D, Nh, 1, N] -> [Nh*D, N]
+            struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);
+
+            // Batched O proj
+            struct ggml_tensor * attn_out = qwen3_linear(ctx, ly->o_proj, attn_cat);
+            hidden                        = ggml_add(ctx, hidden, attn_out);
+            if (m->clamp_fp16) {
+                hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
+            }
+
+            // Batched FFN
+            norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
+            struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, N);
+            hidden                   = ggml_add(ctx, hidden, mlp);
+            if (m->clamp_fp16) {
+                hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
+            }
         }
 
-        // Reshape to heads: [D, Heads, N]
-        q = ggml_reshape_3d(ctx, q, D, Nh, N);
-        k = ggml_reshape_3d(ctx, k, D, Nkv, N);
-        v = ggml_reshape_3d(ctx, v, D, Nkv, N);
+        // Final norm + LM head
+        hidden                         = qwen3_rms_norm(ctx, hidden, m->final_norm, c.rms_norm_eps);
+        out_V                          = (lm_count > 0) ? lm_count : c.vocab_size;
+        struct ggml_tensor * lm_weight = m->embed_tokens;
+        if (lm_count > 0 && m->lm_head_phase2) {
+            // Pre-extracted partial head: contiguous tensor, no view needed
+            lm_weight = m->lm_head_phase2;
+        } else if (lm_count > 0) {
+            // No pre-extracted head available, fall back to full vocab
+            out_V = c.vocab_size;
+        }
+        lgt = ggml_mul_mat(ctx, lm_weight, hidden);  // [out_V, N]
+        ggml_set_name(lgt, "logits");
+        ggml_set_output(lgt);
+        ggml_build_forward_expand(gf, lgt);
 
-        // QK-Norm (rms_norm on dim0=D, per head per seq)
-        q = ggml_rms_norm(ctx, q, c.rms_norm_eps);
-        q = ggml_mul(ctx, q, qwen3_f32(ctx, ly->q_norm));
-        k = ggml_rms_norm(ctx, k, c.rms_norm_eps);
-        k = ggml_mul(ctx, k, qwen3_f32(ctx, ly->k_norm));
-
-        // RoPE: positions [N] maps to dim 2 of [D, Heads, N]
-        q = ggml_rope_ext(ctx, q, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-        k = ggml_rope_ext(ctx, k, positions, NULL, D, 2, 0, c.rope_theta, 1.0f, 0.0f, 1.0f, 0.0f, 0.0f);
-
-        // Contiguous for clean slicing
-        q = ggml_cont(ctx, q);
-        k = ggml_cont(ctx, k);
-        v = ggml_cont(ctx, v);
-
-        // Clamp V before F16 cast (sub-Ampere FP16 accumulation overflow)
-        if (m->clamp_fp16) {
-            v = ggml_clamp(ctx, v, -65504.0f, 65504.0f);
+        if (!static_graph_alloc(&m->batch_graph.graph, m->backend, m->sched, gf)) {
+            fprintf(stderr, "[LM] FATAL: failed to allocate graph (batch decode, N=%d)\n", N);
+            exit(1);
         }
 
-        // Batched attention with 4D KV cache
-        float scale = 1.0f / sqrtf((float) D);
-
-        // Write new K,V to the 4D cache via set_rows over the N consecutive
-        // sets: dst views the [D, max_seq, Nkv, N] slice starting at s0, src
-        // reshapes the fresh [D, Nkv, N] to [D, 1, Nkv, N] (same layout), and
-        // kv_rows [1, 1, N] carries one destination row per set, broadcast
-        // across Nkv.
-        int    s0     = kv_sets[0];  // sets are always consecutive: [s0, s0+1, ..., s0+N-1]
-        size_t off_s0 = (size_t) s0 * m->kv_k4[l]->nb[3];
-
-        struct ggml_tensor * k_sets = ggml_view_4d(ctx, m->kv_k4[l], D, c.max_seq_len, Nkv, N, m->kv_k4[l]->nb[1],
-                                                   m->kv_k4[l]->nb[2], m->kv_k4[l]->nb[3], off_s0);
-        struct ggml_tensor * v_sets = ggml_view_4d(ctx, m->kv_v4[l], D, c.max_seq_len, Nkv, N, m->kv_v4[l]->nb[1],
-                                                   m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3], off_s0);
-
-        struct ggml_tensor * k_new = ggml_reshape_4d(ctx, k, D, 1, Nkv, N);
-        struct ggml_tensor * v_new = ggml_reshape_4d(ctx, v, D, 1, Nkv, N);
-
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_sets, k_new, kv_rows));
-        ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_sets, v_new, kv_rows));
-
-        // Q: [D, Nh, N] -> [D, 1, Nh, N] (n_batch=1, ne3=N for batched flash_attn)
-        struct ggml_tensor * q4 = ggml_reshape_4d(ctx, q, D, 1, Nh, N);
-
-        // Batched KV read: [D, n_kv_pad, Nkv, N] view of 4D cache
-        struct ggml_tensor * k_batch = ggml_view_4d(ctx, m->kv_k4[l], D, n_kv_pad, Nkv, N, m->kv_k4[l]->nb[1],
-                                                    m->kv_k4[l]->nb[2], m->kv_k4[l]->nb[3], off_s0);
-        struct ggml_tensor * v_batch = ggml_view_4d(ctx, m->kv_v4[l], D, n_kv_pad, Nkv, N, m->kv_v4[l]->nb[1],
-                                                    m->kv_v4[l]->nb[2], m->kv_v4[l]->nb[3], off_s0);
-
-        // Batched attention (flash or F32 manual fallback)
-        struct ggml_tensor * attn_result =
-            m->use_flash_attn ? ggml_flash_attn_ext(ctx, q4, k_batch, v_batch, attn_mask, scale, 0.0f, 0.0f) :
-                                qwen3_attn_f32(ctx, q4, k_batch, v_batch, attn_mask, scale);
-        if (m->use_flash_attn) {
-            ggml_flash_attn_ext_set_prec(attn_result, GGML_PREC_F32);
-        }
-
-        // Output: [D, Nh, 1, N] -> [Nh*D, N]
-        struct ggml_tensor * attn_cat = ggml_reshape_2d(ctx, attn_result, Nh * D, N);
-
-        // Batched O proj
-        struct ggml_tensor * attn_out = qwen3_linear(ctx, ly->o_proj, attn_cat);
-        hidden                        = ggml_add(ctx, hidden, attn_out);
-        if (m->clamp_fp16) {
-            hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
-        }
-
-        // Batched FFN
-        norm                     = qwen3_rms_norm(ctx, hidden, ly->post_attn_layernorm, c.rms_norm_eps);
-        struct ggml_tensor * mlp = qwen3_build_mlp(ctx, ly, norm, N);
-        hidden                   = ggml_add(ctx, hidden, mlp);
-        if (m->clamp_fp16) {
-            hidden = ggml_clamp(ctx, hidden, -65504.0f, 65504.0f);
-        }
-    }
-
-    // Final norm + LM head
-    hidden                         = qwen3_rms_norm(ctx, hidden, m->final_norm, c.rms_norm_eps);
-    int                  out_V     = (lm_count > 0) ? lm_count : c.vocab_size;
-    struct ggml_tensor * lm_weight = m->embed_tokens;
-    if (lm_count > 0 && m->lm_head_phase2) {
-        // Pre-extracted partial head: contiguous tensor, no view needed
-        lm_weight = m->lm_head_phase2;
-    } else if (lm_count > 0) {
-        // No pre-extracted head available, fall back to full vocab
-        out_V = c.vocab_size;
-    }
-    struct ggml_tensor * lgt = ggml_mul_mat(ctx, lm_weight, hidden);  // [out_V, N]
-    ggml_set_name(lgt, "logits");
-    ggml_set_output(lgt);
-    ggml_build_forward_expand(gf, lgt);
-
-    // Allocate
-    ggml_backend_sched_reset(m->sched);
-    if (!ggml_backend_sched_alloc_graph(m->sched, gf)) {
-        fprintf(stderr, "[LM] FATAL: failed to allocate graph (batch decode, N=%d)\n", N);
-        exit(1);
+        m->batch_graph.gf            = gf;
+        m->batch_graph.token_ids_t   = token_ids_t;
+        m->batch_graph.positions     = positions;
+        m->batch_graph.kv_rows       = kv_rows;
+        m->batch_graph.attn_mask     = attn_mask;
+        m->batch_graph.lgt           = lgt;
+        m->batch_graph.out_V         = out_V;
+        m->batch_graph.key_n_kv_pad  = n_kv_pad;
+        m->batch_graph.key_N         = N;
+        m->batch_graph.key_s0        = s0;
+        m->batch_graph.key_lm_offset = lm_offset;
+        m->batch_graph.key_lm_count  = lm_count;
+        m->batch_graph.pos_data.resize((size_t) N);
+        m->batch_graph.rows_data.resize((size_t) N);
+        m->batch_graph.mask_data.resize((size_t) n_kv_pad * (size_t) N);
+        m->batch_graph.built = true;
+    } else {
+        gf          = m->batch_graph.gf;
+        token_ids_t = m->batch_graph.token_ids_t;
+        positions   = m->batch_graph.positions;
+        kv_rows     = m->batch_graph.kv_rows;
+        attn_mask   = m->batch_graph.attn_mask;
+        lgt         = m->batch_graph.lgt;
+        out_V       = m->batch_graph.out_V;
     }
 
     // Set token IDs
     ggml_backend_tensor_set(token_ids_t, token_ids, 0, N * sizeof(int));
 
-    // Positions: per-element kv_pos
-    {
-        std::vector<int> pos_data(N);
-        for (int i = 0; i < N; i++) {
-            pos_data[i] = m->kv_pos[kv_sets[i]];
-        }
-        ggml_backend_tensor_set(positions, pos_data.data(), 0, N * sizeof(int));
-
-        std::vector<int64_t> rows_data(N);
-        for (int i = 0; i < N; i++) {
-            rows_data[i] = (int64_t) m->kv_pos[kv_sets[i]];
-        }
-        ggml_backend_tensor_set(kv_rows, rows_data.data(), 0, N * sizeof(int64_t));
+    for (int i = 0; i < N; i++) {
+        m->batch_graph.pos_data[(size_t) i]  = m->kv_pos[kv_sets[i]];
+        m->batch_graph.rows_data[(size_t) i] = (int64_t) m->kv_pos[kv_sets[i]];
     }
+    ggml_backend_tensor_set(positions, m->batch_graph.pos_data.data(), 0, (size_t) N * sizeof(int));
+    ggml_backend_tensor_set(kv_rows, m->batch_graph.rows_data.data(), 0, (size_t) N * sizeof(int64_t));
 
     // Attention mask: [n_kv_pad, 1, 1, N] f16
     // 0.0 for valid KV positions, neg inf past each element's kv_len,
     // padded tail included
-    {
-        std::vector<uint16_t> mask_data((size_t) n_kv_pad * N);
-        for (int i = 0; i < N; i++) {
-            int kvl = m->kv_pos[kv_sets[i]] + 1;  // kv_len after write
-            for (int j = 0; j < n_kv_pad; j++) {
-                mask_data[(size_t) i * n_kv_pad + j] = ggml_fp32_to_fp16((j < kvl) ? 0.0f : -INFINITY);
-            }
+    for (int i = 0; i < N; i++) {
+        int kvl = m->kv_pos[kv_sets[i]] + 1;
+        for (int j = 0; j < n_kv_pad; j++) {
+            m->batch_graph.mask_data[(size_t) i * (size_t) n_kv_pad + (size_t) j] =
+                ggml_fp32_to_fp16((j < kvl) ? 0.0f : -INFINITY);
         }
-        ggml_backend_tensor_set(attn_mask, mask_data.data(), 0, mask_data.size() * sizeof(uint16_t));
     }
-
-    // Compute
-    ggml_backend_sched_graph_compute(m->sched, gf);
+    ggml_backend_tensor_set(attn_mask, m->batch_graph.mask_data.data(), 0,
+                            m->batch_graph.mask_data.size() * sizeof(uint16_t));
+    static_graph_compute(&m->batch_graph.graph, m->backend, m->sched, gf);
 
     // Read logits [out_V, N]
     ggml_backend_tensor_get(lgt, logits, 0, (size_t) out_V * N * sizeof(float));
@@ -833,6 +895,7 @@ static void qw3lm_forward_batch(Qwen3LM *   m,
 
 // Free all resources
 static void qw3lm_free(Qwen3LM * m) {
+    static_graph_release(&m->batch_graph.graph, m->sched);
     graph_arena_free(&m->arena_batch);
     graph_arena_free(&m->arena_decode);
     graph_arena_free(&m->arena_prefill);

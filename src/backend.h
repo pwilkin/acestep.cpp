@@ -83,16 +83,43 @@ static void acestep_ggml_log(enum ggml_log_level level, const char * text, void 
     fflush(stderr);
 }
 
-// Initialize backends: load all available (CUDA, Metal, Vulkan...),
-// pick the best one, keep CPU as fallback.
+// Device named by --device, NULL for the best available one. Inline so
+// every translation unit of the binary sees the one main sets.
+inline const char * g_backend_device = NULL;
+
+// Install the log callback and load every backend, once per process.
+static void backend_load(void) {
+    static const bool loaded = [] {
+        ggml_log_set(acestep_ggml_log, nullptr);
+        ggml_backend_load_all();
+        return true;
+    }();
+    (void) loaded;
+}
+
+// Select the device of every later backend_init by name (CUDA0, Vulkan0,
+// MTL0, CPU...). Returns false and lists the available devices when the
+// name matches none.
+static bool backend_set_device(const char * name) {
+    backend_load();
+    if (!ggml_backend_dev_by_name(name)) {
+        fprintf(stderr, "--device %s not found. Available:", name);
+        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+            fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
+        }
+        fprintf(stderr, "\n");
+        return false;
+    }
+    g_backend_device = name;
+    return true;
+}
+
+// Initialize backends: the device named by --device or the best available
+// one (CUDA, Metal, Vulkan...), keep CPU as fallback.
 // label: log prefix, e.g. "DiT", "VAE", "LM"
 // Subsequent calls reuse the same backend (single VMM pool).
 static BackendPair backend_init(const char * label) {
-    static bool log_installed = false;
-    if (!log_installed) {
-        ggml_log_set(acestep_ggml_log, nullptr);
-        log_installed = true;
-    }
+    backend_load();
 
     if (g_backend_refs > 0) {
         g_backend_refs++;
@@ -100,25 +127,8 @@ static BackendPair backend_init(const char * label) {
         return g_backend_cache;
     }
 
-    ggml_backend_load_all();
     BackendPair bp = {};
-
-    // GGML_BACKEND env var: force a specific device instead of auto-best.
-    // Device names: CUDA0, Vulkan0, CPU, BLAS (see ggml_backend_dev_name).
-    const char * force_backend = std::getenv("GGML_BACKEND");
-    if (force_backend) {
-        bp.backend = ggml_backend_init_by_name(force_backend, nullptr);
-        if (!bp.backend) {
-            fprintf(stderr, "[Load] FATAL: GGML_BACKEND=%s not found. Available:", force_backend);
-            for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                fprintf(stderr, " %s", ggml_backend_dev_name(ggml_backend_dev_get(i)));
-            }
-            fprintf(stderr, "\n");
-            exit(1);
-        }
-    } else {
-        bp.backend = ggml_backend_init_best();
-    }
+    bp.backend     = g_backend_device ? ggml_backend_init_by_name(g_backend_device, nullptr) : ggml_backend_init_best();
     if (!bp.backend) {
         fprintf(stderr, "[Load] FATAL: no backend available\n");
         exit(1);

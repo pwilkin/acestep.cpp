@@ -26,6 +26,7 @@
 //   neural-codec --vae model.gguf --decode -i song.nac4 -o song.wav
 
 #include "audio-io.h"
+#include "backend.h"
 #include "vae-enc.h"
 #include "vae.h"
 #include "version.h"
@@ -335,6 +336,8 @@ static void print_usage(const char * prog) {
             "Output naming: song.wav -> song.vae (f32) or song.nac8 (Q8) or song.nac4 (Q4)\n"
             "               song.vae -> song.wav\n\n"
             "Memory control:\n"
+            "  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...\n"
+            "                          (default: best available)\n"
             "  --vae-chunk <N>         Latent frames per tile (default: 1024)\n"
             "  --vae-overlap <N>       Overlap frames per side (default: 64)\n\n"
             "Latent formats (decode auto-detects):\n"
@@ -362,6 +365,7 @@ int main(int argc, char ** argv) {
     int          mode        = -1;  // 0 = encode, 1 = decode
     int          quant       = 0;   // 0 = f32, 8 = q8, 4 = q4
     WavFormat    wav_fmt     = WAV_S16;
+    const char * device      = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--vae") == 0 && i + 1 < argc) {
@@ -381,6 +385,8 @@ int main(int argc, char ** argv) {
                 print_usage(argv[0]);
                 return 1;
             }
+        } else if (strcmp(argv[i], "--device") == 0 && i + 1 < argc) {
+            device = argv[++i];
         } else if (strcmp(argv[i], "--vae-chunk") == 0 && i + 1 < argc) {
             chunk_size = atoi(argv[++i]);
         } else if (strcmp(argv[i], "--vae-overlap") == 0 && i + 1 < argc) {
@@ -393,17 +399,17 @@ int main(int argc, char ** argv) {
             quant = 8;
         } else if (strcmp(argv[i], "--q4") == 0) {
             quant = 4;
-        } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
-            print_usage(argv[0]);
-            return 0;
         } else {
-            fprintf(stderr, "Unknown arg: %s\n", argv[i]);
             print_usage(argv[0]);
             return 1;
         }
     }
 
     if (!vae_path || !input_path || mode < 0) {
+        print_usage(argv[0]);
+        return 1;
+    }
+    if (device && !backend_set_device(device)) {
         print_usage(argv[0]);
         return 1;
     }

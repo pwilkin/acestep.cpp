@@ -57,6 +57,8 @@ buildall.cmd      # all backends (CUDA + Vulkan + CPU, runtime loading)
 NVCC_CCBIN=g++-13 ./buildcuda.sh # rolling release distros (Arch w/ GCC 16, etc.)
 ```
 
+`-DGGML_SOURCE_DIR=<path>` swaps the ggml submodule for another tree (upstream ggml, llama.cpp/ggml).
+
 macOS auto-enables Metal and Accelerate BLAS with any of the above.
 
 ## Run
@@ -91,12 +93,11 @@ Adapter:
   --adapters <dir>        Directory of adapters
 
 Memory control:
+  --device <name>         Compute device: CUDA0, Vulkan0, MTL0, CPU...
+                          (default: best available)
   --keep-loaded           Keep models in VRAM between requests
   --vae-chunk <N>         Latent frames per tile (default: 1024)
   --vae-overlap <N>       Overlap frames per side (default: 64)
-
-Output:
-  --mp3-bitrate <kbps>    MP3 bitrate (default: 128)
 
 Server:
   --host <addr>           Listen address (default: 127.0.0.1)

@@ -27,15 +27,21 @@ void ace_lm_default_params(AceLmParams * p);
 // acquired per request, never owned by the context. NULL on invalid input.
 AceLm * ace_lm_load(ModelStore * store, const AceLmParams * params);
 
-// Enrich request with metadata, lyrics, audio codes.
-// out[lm_batch_size] allocated by caller, filled with enriched copies of req.
+// Enrich n_req requests with metadata, lyrics, audio codes in one GPU batch.
+// Requests may differ in caption, lyrics, metadata, duration and seeds, but
+// must agree on the flags steering the batch: audio_codes present, lyrics
+// present, metadata complete, use_cot_caption. Sampling configuration comes
+// from reqs[0]. seed and lm_seed are resolved by the caller and pass through
+// to the matching output. Identical prompts prefill once and share KV copies,
+// so replicating one request with different seeds keeps the old fast path.
+// out[n_req] allocated by caller, filled with enriched copies of each request.
 // mode: LM_MODE_GENERATE (full), LM_MODE_INSPIRE (no codes), LM_MODE_FORMAT (no codes).
 // dump_logits/dump_tokens: debug output paths (NULL to disable).
 // cancel/cancel_data: abort callback, polled between tokens. NULL = never cancel.
 // Returns 0 on success, -1 on error or cancellation.
 int ace_lm_generate(AceLm *            ctx,
-                    const AceRequest * req,
-                    int                lm_batch_size,
+                    const AceRequest * reqs,
+                    int                n_req,
                     AceRequest *       out,
                     const char *       dump_logits,
                     const char *       dump_tokens,
